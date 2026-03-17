@@ -1,0 +1,5 @@
+git clone <tvoj-repo-url>
+# kopiraj mtls-proxy folder u repo
+git add mtls-proxy/
+git commit -m "Add mtls-proxy"
+git push
