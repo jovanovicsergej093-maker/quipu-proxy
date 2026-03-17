@@ -10,10 +10,9 @@ const key = parsePem(process.env.QUIPU_CLIENT_KEY);
 const ca = parsePem(process.env.QUIPU_CA_CERT);
 
 const MERCHANT_ID = process.env.MERCHANT_ID || "ECOM_TEST241";
-const BANK_HOST = process.env.BANK_HOST || "3dss2.quipu.de";
-const BANK_PORT = parseInt(process.env.BANK_PORT || "8443");
+const BANK_HOST = process.env.BANK_HOST || "3dss2test.quipu.de";
+const BANK_PORT = parseInt(process.env.BANK_PORT || "8000");
 
-// Helper: make mTLS request to bank (JSON)
 function makeBankRequest(method, path, body) {
   return new Promise((resolve, reject) => {
     const bodyStr = body ? JSON.stringify(body) : "";
@@ -31,11 +30,9 @@ function makeBankRequest(method, path, body) {
         "Accept": "application/json",
       },
     };
-
     if (bodyStr) {
       options.headers["Content-Length"] = Buffer.byteLength(bodyStr);
     }
-
     const req = https.request(options, (response) => {
       let data = "";
       response.on("data", (chunk) => (data += chunk));
@@ -44,23 +41,20 @@ function makeBankRequest(method, path, body) {
         resolve({ statusCode: response.statusCode, body: data });
       });
     });
-
     req.on("error", reject);
     if (bodyStr) req.write(bodyStr);
     req.end();
   });
 }
 
-// POST /order - Create payment order (JSON API per Quipu docs)
 app.post("/order", async (req, res) => {
   try {
     const { amount, currency, description, approveUrl } = req.body;
-
     const orderPayload = {
       order: {
         typeRid: "ORD1",
         amount: parseFloat(amount).toFixed(2),
-        currency: currency || "EUR",
+        currency: currency || "RSD",
         description: description || "Online payment",
         language: "en",
         hppRedirectUrl: approveUrl,
@@ -81,33 +75,28 @@ app.post("/order", async (req, res) => {
         }
       }
     };
-
     console.log("Sending JSON to bank:", JSON.stringify(orderPayload));
-
     const result = await makeBankRequest("POST", "/order", orderPayload);
-
     let data;
     try {
       data = JSON.parse(result.body);
     } catch (e) {
-      throw new Error(`Failed to parse bank response: ${result.body.substring(0, 300)}`);
+      throw new Error("Failed to parse bank response: " + result.body.substring(0, 300));
     }
-
     if (data.order && data.order.id && data.order.password) {
-      const hppUrl = data.order.hppUrl || `https://${BANK_HOST}:8009/flex`;
-      const paymentUrl = `${hppUrl}?id=${data.order.id}&password=${data.order.password}`;
-
+      const hppUrl = data.order.hppUrl || "https://" + BANK_HOST + ":8009/flex";
+      const paymentUrl = hppUrl + "?id=" + data.order.id + "&password=" + data.order.password;
       res.json({
         success: true,
         orderId: String(data.order.id),
         password: data.order.password,
-        paymentUrl,
+        paymentUrl: paymentUrl,
         status: data.order.status,
       });
     } else {
       res.status(400).json({
         success: false,
-        error: data.errorDescription || data.error || `Unexpected response`,
+        error: data.errorDescription || data.error || "Unexpected response",
         rawResponse: result.body.substring(0, 500),
       });
     }
@@ -117,74 +106,47 @@ app.post("/order", async (req, res) => {
   }
 });
 
-// GET /order-status/:id - Get order details (JSON API per Quipu docs)
 app.get("/order-status/:id", async (req, res) => {
   try {
     const orderId = req.params.id;
     const password = req.query.password || "";
-
-    const path = `/order/${orderId}?password=${encodeURIComponent(password)}&tranDetailLevel=1`;
-    
-    console.log("Getting order status:", path);
-
+    const path = "/order/" + orderId + "?password=" + encodeURIComponent(password) + "&tranDetailLevel=1";
     const result = await makeBankRequest("GET", path, null);
-
     let data;
     try {
       data = JSON.parse(result.body);
     } catch (e) {
-      throw new Error(`Failed to parse bank response: ${result.body.substring(0, 300)}`);
+      throw new Error("Failed to parse bank response: " + result.body.substring(0, 300));
     }
-
-    res.json({
-      success: true,
-      order: data.order || data,
-    });
+    res.json({ success: true, order: data.order || data });
   } catch (err) {
     console.error("Status error:", err.message);
     res.status(502).json({ error: err.message });
   }
 });
 
-// POST /order-status - backward compat
 app.post("/order-status", async (req, res) => {
   try {
     const { orderId, password } = req.body;
-    const path = `/order/${orderId}?password=${encodeURIComponent(password || "")}&tranDetailLevel=1`;
-
-    console.log("Getting order status (POST):", path);
-
+    const path = "/order/" + orderId + "?password=" + encodeURIComponent(password || "") + "&tranDetailLevel=1";
     const result = await makeBankRequest("GET", path, null);
-
     let data;
     try {
       data = JSON.parse(result.body);
     } catch (e) {
-      throw new Error(`Failed to parse bank response: ${result.body.substring(0, 300)}`);
+      throw new Error("Failed to parse bank response: " + result.body.substring(0, 300));
     }
-
-    const orderStatus = data.order?.status || "UNKNOWN";
-
-    res.json({
-      success: true,
-      orderId,
-      orderStatus,
-      rawResponse: result.body.substring(0, 500),
-    });
+    const orderStatus = (data.order && data.order.status) || "UNKNOWN";
+    res.json({ success: true, orderId: orderId, orderStatus: orderStatus, rawResponse: result.body.substring(0, 500) });
   } catch (err) {
     console.error("Status error:", err.message);
     res.status(502).json({ error: err.message });
   }
 });
 
-app.get("/health", (_, res) => {
-  res.json({
-    status: "ok",
-    mtls: Boolean(cert && key && ca),
-    merchantId: MERCHANT_ID,
-    apiFormat: "JSON",
-  });
+app.get("/health", function(_, res) {
+  res.json({ status: "ok", mtls: Boolean(cert && key && ca), merchantId: MERCHANT_ID, bankHost: BANK_HOST, bankPort: BANK_PORT, apiFormat: "JSON" });
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`mTLS proxy running on port ${PORT}`));
+app.listen(PORT, function() { console.log("mTLS proxy running on port " + PORT); });
