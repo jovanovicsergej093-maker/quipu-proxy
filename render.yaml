@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: quipu-mtls-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: CLIENT_CERT
+        sync: false
+      - key: CLIENT_KEY
+        sync: false
+      - key: CA_CERT
+        sync: false
+      - key: MERCHANT_ID
+        value: ECOM_TEST241
+      - key: PROXY_API_KEY
+        generateValue: true
