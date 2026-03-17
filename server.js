@@ -10,24 +10,31 @@ const key = parsePem(process.env.QUIPU_CLIENT_KEY);
 const ca = parsePem(process.env.QUIPU_CA_CERT);
 
 const MERCHANT_ID = process.env.MERCHANT_ID || "ECOM_TEST241";
+const BANK_HOST = process.env.BANK_HOST || "3dss2.quipu.de";
+const BANK_PORT = parseInt(process.env.BANK_PORT || "8443");
 
-// Helper: make mTLS request to bank
-function makeBankRequest(path, body, contentType) {
+// Helper: make mTLS request to bank (JSON)
+function makeBankRequest(method, path, body) {
   return new Promise((resolve, reject) => {
+    const bodyStr = body ? JSON.stringify(body) : "";
     const options = {
-      hostname: "3dss2.quipu.de",
-      port: 8443,
+      hostname: BANK_HOST,
+      port: BANK_PORT,
       path,
-      method: "POST",
+      method,
       cert,
       key,
       ca,
       rejectUnauthorized: false,
       headers: {
-        "Content-Type": contentType || "application/xml",
-        "Content-Length": Buffer.byteLength(body),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
       },
     };
+
+    if (bodyStr) {
+      options.headers["Content-Length"] = Buffer.byteLength(bodyStr);
+    }
 
     const req = https.request(options, (response) => {
       let data = "";
@@ -39,72 +46,68 @@ function makeBankRequest(path, body, contentType) {
     });
 
     req.on("error", reject);
-    req.write(body);
+    if (bodyStr) req.write(bodyStr);
     req.end();
   });
 }
 
-// Helper: extract XML tag value
-function extractXml(xml, tag) {
-  const regex = new RegExp(`<${tag}>([^<]*)</${tag}>`, "i");
-  const match = xml.match(regex);
-  return match ? match[1] : null;
-}
-
-// POST /order - Create payment order via XML
+// POST /order - Create payment order (JSON API per Quipu docs)
 app.post("/order", async (req, res) => {
   try {
-    const { amount, currency, description, approveUrl, cancelUrl, declineUrl } = req.body;
+    const { amount, currency, description, approveUrl } = req.body;
 
-    // Amount in minor units (cents): 25.98 EUR -> 2598
-    const amountMinor = Math.round(parseFloat(amount) * 100);
-    // Currency as ISO 4217 numeric code (EUR = 978, RSD = 941)
-    const currencyCode = currency || "978";
+    const orderPayload = {
+      order: {
+        typeRid: "ORD1",
+        amount: parseFloat(amount).toFixed(2),
+        currency: currency || "EUR",
+        description: description || "Online payment",
+        language: "en",
+        hppRedirectUrl: approveUrl,
+        initiationEnvKind: "Browser",
+        consumerDevice: {
+          browser: {
+            javaEnabled: false,
+            jsEnabled: true,
+            acceptHeader: "application/json,application/jose;charset=utf-8",
+            ip: "127.0.0.1",
+            colorDepth: "24",
+            screenW: "1920",
+            screenH: "1080",
+            tzOffset: "-60",
+            language: "sr-RS",
+            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          }
+        }
+      }
+    };
 
-    const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
-<TKKPG>
-  <Request>
-    <Operation>CreateOrder</Operation>
-    <Language>EN</Language>
-    <Order>
-      <OrderType>Purchase</OrderType>
-      <Merchant>${MERCHANT_ID}</Merchant>
-      <Amount>${amountMinor}</Amount>
-      <Currency>${currencyCode}</Currency>
-      <Description>${description || "Online payment"}</Description>
-      <ApproveURL>${approveUrl}</ApproveURL>
-      <CancelURL>${cancelUrl || approveUrl}</CancelURL>
-      <DeclineURL>${declineUrl || approveUrl}</DeclineURL>
-    </Order>
-  </Request>
-</TKKPG>`;
+    console.log("Sending JSON to bank:", JSON.stringify(orderPayload));
 
-    console.log("Sending XML to bank:", xmlBody);
+    const result = await makeBankRequest("POST", "/order", orderPayload);
 
-    const result = await makeBankRequest("/Exec", xmlBody);
+    let data;
+    try {
+      data = JSON.parse(result.body);
+    } catch (e) {
+      throw new Error(`Failed to parse bank response: ${result.body.substring(0, 300)}`);
+    }
 
-    // Parse XML response
-    const status = extractXml(result.body, "Status");
-    const orderId = extractXml(result.body, "OrderID");
-    const sessionId = extractXml(result.body, "SessionID");
-    const url = extractXml(result.body, "URL");
-
-    if (status === "00" && orderId && sessionId) {
-      // Construct payment URL
-      const paymentUrl = url
-        ? `${url}?ORDERID=${orderId}&SESSIONID=${sessionId}`
-        : `https://3dss2.quipu.de/index.jsp?ORDERID=${orderId}&SESSIONID=${sessionId}`;
+    if (data.order && data.order.id && data.order.password) {
+      const hppUrl = data.order.hppUrl || `https://${BANK_HOST}:8009/flex`;
+      const paymentUrl = `${hppUrl}?id=${data.order.id}&password=${data.order.password}`;
 
       res.json({
         success: true,
-        orderId,
-        sessionId,
+        orderId: String(data.order.id),
+        password: data.order.password,
         paymentUrl,
+        status: data.order.status,
       });
     } else {
       res.status(400).json({
         success: false,
-        error: `Bank returned status: ${status}`,
+        error: data.errorDescription || data.error || `Unexpected response`,
         rawResponse: result.body.substring(0, 500),
       });
     }
@@ -114,36 +117,28 @@ app.post("/order", async (req, res) => {
   }
 });
 
-// POST /order-status - Get order status via XML
-app.post("/order-status", async (req, res) => {
+// GET /order-status/:id - Get order details (JSON API per Quipu docs)
+app.get("/order-status/:id", async (req, res) => {
   try {
-    const { orderId, sessionId } = req.body;
+    const orderId = req.params.id;
+    const password = req.query.password || "";
 
-    const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
-<TKKPG>
-  <Request>
-    <Operation>GetOrderStatus</Operation>
-    <Language>EN</Language>
-    <Order>
-      <Merchant>${MERCHANT_ID}</Merchant>
-      <OrderID>${orderId}</OrderID>
-    </Order>
-    <SessionID>${sessionId}</SessionID>
-  </Request>
-</TKKPG>`;
+    const path = `/order/${orderId}?password=${encodeURIComponent(password)}&tranDetailLevel=1`;
+    
+    console.log("Getting order status:", path);
 
-    console.log("Getting order status:", xmlBody);
+    const result = await makeBankRequest("GET", path, null);
 
-    const result = await makeBankRequest("/Exec", xmlBody);
-
-    const status = extractXml(result.body, "Status");
-    const orderStatus = extractXml(result.body, "OrderStatus");
+    let data;
+    try {
+      data = JSON.parse(result.body);
+    } catch (e) {
+      throw new Error(`Failed to parse bank response: ${result.body.substring(0, 300)}`);
+    }
 
     res.json({
-      success: status === "00",
-      orderId,
-      orderStatus: orderStatus || "UNKNOWN",
-      rawResponse: result.body.substring(0, 500),
+      success: true,
+      order: data.order || data,
     });
   } catch (err) {
     console.error("Status error:", err.message);
@@ -151,36 +146,30 @@ app.post("/order-status", async (req, res) => {
   }
 });
 
-// Keep old GET endpoint for backward compat
-app.get("/order/:id", async (req, res) => {
+// POST /order-status - backward compat
+app.post("/order-status", async (req, res) => {
   try {
-    const orderId = req.params.id;
-    const sessionId = req.query.password || req.query.sessionId || "";
+    const { orderId, password } = req.body;
+    const path = `/order/${orderId}?password=${encodeURIComponent(password || "")}&tranDetailLevel=1`;
 
-    const xmlBody = `<?xml version="1.0" encoding="UTF-8"?>
-<TKKPG>
-  <Request>
-    <Operation>GetOrderStatus</Operation>
-    <Language>EN</Language>
-    <Order>
-      <Merchant>${MERCHANT_ID}</Merchant>
-      <OrderID>${orderId}</OrderID>
-    </Order>
-    <SessionID>${sessionId}</SessionID>
-  </Request>
-</TKKPG>`;
+    console.log("Getting order status (POST):", path);
 
-    const result = await makeBankRequest("/Exec", xmlBody);
+    const result = await makeBankRequest("GET", path, null);
 
-    const status = extractXml(result.body, "Status");
-    const orderStatus = extractXml(result.body, "OrderStatus");
+    let data;
+    try {
+      data = JSON.parse(result.body);
+    } catch (e) {
+      throw new Error(`Failed to parse bank response: ${result.body.substring(0, 300)}`);
+    }
+
+    const orderStatus = data.order?.status || "UNKNOWN";
 
     res.json({
-      success: status === "00",
-      order: {
-        id: orderId,
-        status: orderStatus || "UNKNOWN",
-      },
+      success: true,
+      orderId,
+      orderStatus,
+      rawResponse: result.body.substring(0, 500),
     });
   } catch (err) {
     console.error("Status error:", err.message);
@@ -193,6 +182,7 @@ app.get("/health", (_, res) => {
     status: "ok",
     mtls: Boolean(cert && key && ca),
     merchantId: MERCHANT_ID,
+    apiFormat: "JSON",
   });
 });
 
