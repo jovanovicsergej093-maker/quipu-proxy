@@ -1,113 +1,72 @@
-const express = require('express');
-const https = require('https');
+const express = require("express");
+const https = require("https");
 const app = express();
-
-const PORT = process.env.PORT || 3001;
-const QUIPU_API_BASE = 'https://3dss2test.quipu.de:8000';
-const MERCHANT_ID = process.env.MERCHANT_ID || 'ECOM_TEST241';
-const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
-
-// Certificates from environment variables
-const CLIENT_CERT = process.env.CLIENT_CERT || '';
-const CLIENT_KEY = process.env.CLIENT_KEY || '';
-const CA_CERT = process.env.CA_CERT || '';
 
 app.use(express.json());
 
-// CORS
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Proxy-Key');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+const QUIPU_BASE = "https://3dss2.quipu.de:8443";
 
-// Simple API key auth to protect the proxy
-app.use((req, res, next) => {
-  if (req.path === '/health') return next();
-  const key = req.headers['x-proxy-key'];
-  if (PROXY_API_KEY && key !== PROXY_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
+const parsePem = (env) => (env || "").replace(/\\n/g, "\n");
+
+const cert = parsePem(process.env.QUIPU_CLIENT_CERT);
+const key = parsePem(process.env.QUIPU_CLIENT_KEY);
+const ca = parsePem(process.env.QUIPU_CA_CERT);
+
+app.post("/order", async (req, res) => {
+  try {
+    const body = JSON.stringify(req.body);
+    console.log("Creating order:", body.substring(0, 200));
+    const data = await makeRequest("POST", "/order", body);
+    res.json(data);
+  } catch (err) {
+    console.error("Order error:", err.message);
+    res.status(502).json({ error: err.message });
   }
-  next();
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', mtls: !!CLIENT_CERT });
+app.get("/order/:id", async (req, res) => {
+  try {
+    const path = `/order/${req.params.id}?password=${encodeURIComponent(req.query.password || "")}`;
+    console.log("Getting status:", path);
+    const data = await makeRequest("GET", path);
+    res.json(data);
+  } catch (err) {
+    console.error("Status error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
 });
 
-// Create mTLS agent
-function createMtlsAgent() {
-  const options = {};
-  if (CLIENT_CERT) options.cert = CLIENT_CERT;
-  if (CLIENT_KEY) options.key = CLIENT_KEY;
-  if (CA_CERT) options.ca = CA_CERT;
-  options.rejectUnauthorized = true;
-  return new https.Agent(options);
+function makeRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: "3dss2.quipu.de",
+      port: 8443,
+      path,
+      method,
+      cert,
+      key,
+      ca,
+      rejectUnauthorized: false,
+      headers: { "Content-Type": "application/json" },
+    };
+    if (body) options.headers["Content-Length"] = Buffer.byteLength(body);
+
+    const req = https.request(options, (response) => {
+      let data = "";
+      response.on("data", (chunk) => (data += chunk));
+      response.on("end", () => {
+        console.log("Quipu response:", response.statusCode, data.substring(0, 300));
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error(`Invalid response: ${data}`)); }
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
-// POST /create-order - Create payment order
-app.post('/create-order', async (req, res) => {
-  try {
-    const agent = createMtlsAgent();
-    const url = `${QUIPU_API_BASE}/order`;
-    
-    console.log('Creating order:', JSON.stringify(req.body));
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-Merchant-ID': MERCHANT_ID,
-      },
-      body: JSON.stringify(req.body),
-      dispatcher: agent,
-    });
+app.get("/health", (_, res) => res.json({ status: "ok" }));
 
-    const text = await response.text();
-    console.log('Quipu response:', response.status, text);
-
-    res.status(response.status).send(text);
-  } catch (error) {
-    console.error('Create order error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// GET /order-status/:orderId - Get payment status
-app.get('/order-status/:orderId', async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const { password } = req.query;
-    const agent = createMtlsAgent();
-    const url = `${QUIPU_API_BASE}/order/${orderId}?password=${encodeURIComponent(password)}`;
-
-    console.log('Checking order status:', orderId);
-
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json',
-        'X-Merchant-ID': MERCHANT_ID,
-      },
-      dispatcher: agent,
-    });
-
-    const text = await response.text();
-    console.log('Status response:', response.status, text);
-
-    res.status(response.status).send(text);
-  } catch (error) {
-    console.error('Get status error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`mTLS proxy running on port ${PORT}`);
-  console.log(`Client cert loaded: ${!!CLIENT_CERT}`);
-  console.log(`CA cert loaded: ${!!CA_CERT}`);
-});
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`mTLS proxy running on port ${PORT}`));
