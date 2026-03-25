@@ -9,9 +9,9 @@ const cert = parsePem(process.env.QUIPU_CLIENT_CERT);
 const key = parsePem(process.env.QUIPU_CLIENT_KEY);
 const ca = parsePem(process.env.QUIPU_CA_CERT);
 
-const MERCHANT_ID = process.env.MERCHANT_ID || "ECOM_TEST241";
-const BANK_HOST = process.env.BANK_HOST || "3dss2test.quipu.de";
-const BANK_PORT = parseInt(process.env.BANK_PORT || "8000");
+const MERCHANT_ID = process.env.MERCHANT_ID || "MEBL_CENTAR";
+const BANK_HOST = process.env.BANK_HOST || "3dss2.quipu.de";
+const BANK_PORT = parseInt(process.env.BANK_PORT || "8443");
 
 // Helper: make mTLS request to bank (JSON)
 function makeBankRequest(method, path, body) {
@@ -58,6 +58,7 @@ app.post("/order", async (req, res) => {
 
     const orderPayload = {
       order: {
+        typeRid: "45",
         amount: parseFloat(amount).toFixed(2),
         currency: currency || "RSD",
         description: description || "Online payment",
